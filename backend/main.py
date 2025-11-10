@@ -1,3 +1,5 @@
+import logging, traceback
+logger = logging.getLogger("uvicorn.error")
 from __future__ import annotations
 import os, datetime
 from fastapi import FastAPI, HTTPException
@@ -63,55 +65,79 @@ class GenerateOut(BaseModel):
 
 @app.post("/generate", response_model=GenerateOut)
 async def generate(data: GenerateIn):
-    r = Resume(
-        name=data.resume.name,
-        email=data.resume.email,
-        phone=data.resume.phone,
-        location=data.resume.location,
-        links=data.resume.links or [],
-        summary=data.resume.summary,
-        skills=data.resume.skills,
-        experience=[
-            Experience(company=x.company, title=x.title, start=x.start, end=x.end, bullets=x.bullets)
-            for x in data.resume.experience
-        ],
-        education=[Education(degree=e.degree, school=e.school, start=e.start, end=e.end) for e in data.resume.education],
-    )
-
-    # naive keyword pass
-    kw = [w.strip(",.()").lower() for w in data.job_description.split() if len(w) > 3]
-    kw = list(dict.fromkeys(kw))
-
-    today = datetime.date.today().strftime("%d %B %Y")
-    use_llm = os.getenv("OPENAI_API_KEY") and os.getenv("ENABLE_LLM", "0") == "1"
-
-    if not use_llm:
-        # ✅ pass JD text to enable domain detection
-        text = render_local(r, company=data.company, role=data.role, job_keywords=kw, today=today, jd_text=data.job_description)
-        return {"cover_letter": text, "mode": "local"}
-
-    # (LLM path unchanged)
     try:
-        from openai import OpenAI  # type: ignore
-        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-        prompt = USER_PROMPT.format(
-            resume=data.resume.model_dump(),
-            jd=data.job_description,
-            role=data.role,
-            company=data.company,
-            tone=data.tone,
-            length=data.length,
+        r = Resume(
+            name=data.resume.name,
+            email=data.resume.email,
+            phone=data.resume.phone,
+            location=data.resume.location,
+            links=data.resume.links or [],
+            summary=data.resume.summary,
+            skills=data.resume.skills,
+            experience=[
+                Experience(company=x.company, title=x.title, start=x.start, end=x.end, bullets=x.bullets)
+                for x in data.resume.experience
+            ],
+            education=[
+                Education(degree=e.degree, school=e.school, start=e.start, end=e.end)
+                for e in data.resume.education
+            ],
         )
-        resp = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
-            temperature=0.4,
-        )
-        text = resp.choices[0].message.content
-        return {"cover_letter": text, "mode": "llm"}
-    except Exception:
-        text = render_local(r, company=data.company, role=data.role, job_keywords=kw, today=today, jd_text=data.job_description)
-        return {"cover_letter": text, "mode": "local"}
+
+        # naive keyword extraction
+        kw = [w.strip(",.()").lower() for w in data.job_description.split() if len(w) > 3]
+        kw = list(dict.fromkeys(kw))
+
+        today = datetime.date.today().strftime("%d %B %Y")
+        use_llm = os.getenv("OPENAI_API_KEY") and os.getenv("ENABLE_LLM", "0") == "1"
+
+        if not use_llm:
+            text = render_local(
+                r,
+                company=data.company,
+                role=data.role,
+                job_keywords=kw,
+                today=today,
+                jd_text=data.job_description,   # passes JD for domain detection
+            )
+            return {"cover_letter": text, "mode": "local"}
+
+        # LLM path (unchanged)
+        try:
+            from openai import OpenAI  # type: ignore
+            client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+            prompt = USER_PROMPT.format(
+                resume=data.resume.model_dump(),
+                jd=data.job_description,
+                role=data.role,
+                company=data.company,
+                tone=data.tone,
+                length=data.length,
+            )
+            resp = client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
+                temperature=0.4,
+            )
+            text = resp.choices[0].message.content
+            return {"cover_letter": text, "mode": "llm"}
+        except Exception:
+            logger.exception("LLM path failed; falling back to local")
+            text = render_local(
+                r,
+                company=data.company,
+                role=data.role,
+                job_keywords=kw,
+                today=today,
+                jd_text=data.job_description,
+            )
+            return {"cover_letter": text, "mode": "local"}
+
+    except Exception as e:
+        logger.exception("generate() failed")
+        # Return the error to the client so we see it in the browser too
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
 
 @app.get("/healthz")
 async def healthz():

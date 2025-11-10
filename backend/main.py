@@ -5,8 +5,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from dotenv import load_dotenv
-from model import Resume, Experience, Education, render_local
-from prompt_templates import SYSTEM_PROMPT, USER_PROMPT
+from .model import Resume, Experience, Education, render_local
+from .prompt_templates import SYSTEM_PROMPT, USER_PROMPT
+
 
 load_dotenv()
 app = FastAPI(title="TailorCover API", version="0.1.0")

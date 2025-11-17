@@ -1,48 +1,13 @@
 from __future__ import annotations
-
-import os
-import datetime
-import logging
+from dataclasses import dataclass
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from dotenv import load_dotenv
+from jinja2 import Template
 
-from .model import Resume, Experience, Education, render_local
-from .prompt_templates import SYSTEM_PROMPT, USER_PROMPT
+# ----------------- Data models -----------------
 
-# -------------------------------------------------
-# Setup
-# -------------------------------------------------
-
-load_dotenv()
-logger = logging.getLogger("uvicorn.error")
-
-app = FastAPI(title="TailorCover API", version="0.1.0")
-
-# CORS: allow your GitHub Pages frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://freeteejay.github.io",
-        "https://freeteejay.github.io/",
-        # optional: uncomment for local testing
-        # "http://localhost:8000",
-        # "http://127.0.0.1:8000",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# -------------------------------------------------
-# Schemas
-# -------------------------------------------------
-
-class ExperienceIn(BaseModel):
+@dataclass
+class Experience:
     company: str
     title: str
     start: str
@@ -50,156 +15,152 @@ class ExperienceIn(BaseModel):
     bullets: List[str]
 
 
-class EducationIn(BaseModel):
+@dataclass
+class Education:
     degree: str
     school: str
     start: str
     end: str
 
 
-class ResumeIn(BaseModel):
+@dataclass
+class Resume:
     name: str
     email: str
-    phone: Optional[str] = None
-    location: Optional[str] = None
-    links: Optional[List[str]] = None
-    summary: Optional[str] = None
-    skills: List[str] = []
-    experience: List[ExperienceIn]
-    education: List[EducationIn]
+    phone: Optional[str]
+    location: Optional[str]
+    links: List[str]
+    summary: Optional[str]
+    skills: List[str]
+    experience: List[Experience]
+    education: List[Education]
 
 
-class GenerateIn(BaseModel):
-    resume: ResumeIn
-    job_description: str = Field(..., min_length=20)
-    role: str
-    company: str
-    tone: str = "concise, confident"
-    length: str = "short"
+# ----------------- Domain logic -----------------
+
+DOMAIN_KEYWORDS = {
+    "hospitality": [
+        "catering", "hospitality", "waitstaff", "server", "barista", "kitchen",
+        "banquet", "front-of-house", "foh", "pos", "plating", "haccp",
+        "food safety", "allergen", "chef", "venue", "function", "event",
+    ],
+    "software": [
+        "python", "javascript", "typescript", "react", "api", "fastapi", "docker",
+        "ci/cd", "git", "aws", "azure", "gcp", "database", "sql",
+        "ml", "machine learning", "ai", "testing", "unit",
+    ],
+    "retail": [
+        "retail", "sales", "pos", "store", "merchandising", "customer",
+        "inventory", "stock", "cash", "replenishment", "register", "floor",
+    ],
+}
 
 
-class GenerateOut(BaseModel):
-    cover_letter: str
-    mode: str
+def infer_domain(text: str) -> str:
+    t = text.lower()
+    scores = {
+        dom: sum(t.count(kw) for kw in kws)
+        for dom, kws in DOMAIN_KEYWORDS.items()
+    }
+    return max(scores, key=scores.get) if any(scores.values()) else "generic"
 
 
-# -------------------------------------------------
-# Routes
-# -------------------------------------------------
+def select_bullets(resume: Resume, job_keywords: List[str], max_items: int = 5) -> List[str]:
+    kws = [k.lower() for k in job_keywords]
+    scored: List[tuple[int, str]] = []
 
-@app.get("/")
-def index():
-    return {"ok": True, "routes": ["/healthz", "/generate", "/docs"]}
+    # score bullets by keyword overlap
+    for xp in resume.experience:
+        for b in xp.bullets:
+            score = sum(1 for k in kws if k and k in b.lower())
+            if score:
+                scored.append((score, b))
+
+    # fallback: recent experience if nothing matched
+    if not scored:
+        for xp in resume.experience[:2]:
+            for b in xp.bullets:
+                scored.append((0, b))
+
+    scored.sort(key=lambda t: t[0], reverse=True)
+    out: List[str] = []
+    seen = set()
+    for _, b in scored:
+        if b not in seen:
+            seen.add(b)
+            out.append(b)
+        if len(out) >= max_items:
+            break
+    return out
 
 
-@app.get("/healthz")
-async def healthz():
-    return {"ok": True}
+# ----------------- Template + renderer -----------------
 
-
-@app.post("/generate", response_model=GenerateOut)
-async def generate(data: GenerateIn):
+LOCAL_TEMPLATE = Template(
     """
-    Generate a tailored cover letter.
+{{ name }}
+{{ location or '' }} | {{ email }}{% if phone %} | {{ phone }}{% endif %}{% if links %} | {{ ', '.join(links) }}{% endif %}
 
-    - If ENABLE_LLM=1 and OPENAI_API_KEY is set → use LLM mode.
-    - Otherwise → use local, domain-aware template logic.
+{{ today }}
+
+Hiring Manager
+{{ company }}
+
+Re: {{ role }}
+
+Dear Hiring Team,
+
+{% if summary %}{{ summary }} {% endif %}I'm applying for the {{ role }} role at {{ company }}.
+
+{% if domain == 'hospitality' -%}
+I work comfortably in fast-paced, customer-facing service environments and follow food-safety standards. Highlights:
+{% elif domain == 'retail' -%}
+I bring reliable customer service, accurate POS handling, and tidy, well-presented stock. Highlights:
+{% elif domain == 'software' -%}
+I ship maintainable code, communicate clearly in reviews, and automate repetitive tasks. Highlights:
+{% else -%}
+Relevant highlights:
+{% endif %}
+
+{% for b in matched_bullets -%}
+- {{ b }}
+{% endfor %}
+
+I value clear outcomes and reliability. I’d be happy to discuss availability or complete a short trial to demonstrate fit.
+
+Kind regards,
+{{ name }}
+"""
+)
+
+
+def render_local(
+    resume: Resume,
+    company: str,
+    role: str,
+    job_keywords: List[str],
+    today: str,
+    jd_text: Optional[str] = None,
+) -> str:
     """
-    try:
-        # Map Pydantic ResumeIn to dataclass Resume
-        r = Resume(
-            name=data.resume.name,
-            email=data.resume.email,
-            phone=data.resume.phone,
-            location=data.resume.location,
-            links=data.resume.links or [],
-            summary=data.resume.summary,
-            skills=data.resume.skills,
-            experience=[
-                Experience(
-                    company=x.company,
-                    title=x.title,
-                    start=x.start,
-                    end=x.end,
-                    bullets=x.bullets,
-                )
-                for x in data.resume.experience
-            ],
-            education=[
-                Education(
-                    degree=e.degree,
-                    school=e.school,
-                    start=e.start,
-                    end=e.end,
-                )
-                for e in data.resume.education
-            ],
-        )
+    Local template-based generator.
 
-        # simple keyword extraction from JD
-        kw = [
-            w.strip(",.()").lower()
-            for w in data.job_description.split()
-            if len(w) > 3
-        ]
-        # remove duplicates while keeping order
-        kw = list(dict.fromkeys(kw))
+    jd_text is used to help infer the domain (hospitality/software/retail/generic).
+    """
+    combined = " ".join(job_keywords) + " " + (jd_text or "")
+    domain = infer_domain(combined)
+    bullets = select_bullets(resume, job_keywords)
 
-        today = datetime.date.today().strftime("%d %B %Y")
-        use_llm = bool(os.getenv("OPENAI_API_KEY")) and os.getenv("ENABLE_LLM", "0") == "1"
-
-        # -------- Local mode --------
-        if not use_llm:
-            text = render_local(
-                resume=r,
-                company=data.company,
-                role=data.role,
-                job_keywords=kw,
-                today=today,
-                jd_text=data.job_description,
-            )
-            return {"cover_letter": text, "mode": "local"}
-
-        # -------- LLM mode --------
-        try:
-            from openai import OpenAI  # type: ignore
-
-            client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-            prompt = USER_PROMPT.format(
-                resume=data.resume.model_dump(),
-                jd=data.job_description,
-                role=data.role,
-                company=data.company,
-                tone=data.tone,
-                length=data.length,
-            )
-
-            resp = client.chat.completions.create(
-                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.4,
-            )
-            text = resp.choices[0].message.content
-            return {"cover_letter": text, "mode": "llm"}
-        except Exception:
-            logger.exception("LLM path failed; falling back to local")
-            text = render_local(
-                resume=r,
-                company=data.company,
-                role=data.role,
-                job_keywords=kw,
-                today=today,
-                jd_text=data.job_description,
-            )
-            return {"cover_letter": text, "mode": "local"}
-
-    except Exception as e:
-        logger.exception("generate() failed")
-        # expose detail for debugging (fine for a demo)
-        raise HTTPException(
-            status_code=500,
-            detail=f"{type(e).__name__}: {e}",
-        )
+    return LOCAL_TEMPLATE.render(
+        name=resume.name,
+        email=resume.email,
+        phone=resume.phone,
+        location=resume.location,
+        links=resume.links,
+        summary=resume.summary,
+        company=company,
+        role=role,
+        matched_bullets=bullets,
+        today=today,
+        domain=domain,
+    )
